@@ -1,0 +1,85 @@
+name: Secure RDP (Tailscale Edition)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-session:
+    runs-on: windows-latest
+    timeout-minutes: 360  # 6 Jam max, biar gak boncos kuota actions
+
+    steps:
+      - name: 🛠️ Setup Network & Firewall
+        run: |
+          # Enable RDP & Disable NLA (Wajib buat non-domain join)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1 -Force
+          
+          # Hapus rule lama kalo ada
+          netsh advfirewall firewall delete rule name="Allow-RDP"
+          
+          # Buka port 3389 (TCP & UDP) biar koneksi lancar
+          netsh advfirewall firewall add rule name="Allow-RDP" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="Allow-RDP" dir=in action=allow protocol=UDP localport=3389
+
+      - name: 👤 Create Secure User
+        id: create_user
+        run: |
+          # Generate Password Random yang Kuat (24 Karakter)
+          $pass = -join ((33..126) | Get-Random -Count 24 | % {[char]$_})
+          $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
+          
+          # Bikin User "RDP"
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -Description "Github Actions RDP"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          # Simpan Creds ke GITHUB_ENV pake cara aman
+          "RDP_PASSWORD=$pass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          
+          Write-Host "✅ User RDP Created Successfully."
+
+      - name: 🦎 Install & Connect Tailscale
+        run: |
+          # Pake Chocolatey biar dapet versi Stable Terbaru (Gak perlu hardcode link MSI)
+          choco install tailscale -y
+          
+          # Refresh path environment biar command tailscale kebaca
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          
+          # Start Tailscale
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="github-runner-$env:GITHUB_RUN_ID" --accept-routes
+          
+          # Ambil IP Tailscale
+          $tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 📡 Connection Info
+        run: |
+          Write-Host "========================================="
+          Write-Host "       🚀 RDP SESSION READY 🚀"
+          Write-Host "========================================="
+          Write-Host "IP Address (Tailscale) : $env:TAILSCALE_IP"
+          Write-Host "Username               : RDP"
+          Write-Host "Password               : $env:RDP_PASSWORD"
+          Write-Host "========================================="
+          Write-Host "⚠️  WARNING: Segera login! Session ini jalan max 6 jam."
+          Write-Host "⚠️  JANGAN share logs ini ke publik."
+
+      - name: ⏳ Keep Alive Loop
+        run: |
+          $i = 0
+          while ($true) {
+            $i++
+            Write-Host "[$i] Session Active - $(Get-Date)"
+            
+            # Cek status Tailscale tiap loop biar ketahuan kalo putus
+            $status = & "C:\Program Files\Tailscale\tailscale.exe" status
+            if ($status -match "stopped") {
+                Write-Error "Tailscale mati, stopping workflow."
+                exit 1
+            }
+            
+            Start-Sleep -Seconds 60
+          }
